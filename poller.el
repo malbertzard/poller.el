@@ -583,9 +583,7 @@ Each function receives:
 
 (defun poller-json-parser (raw)
   "Parse RAW json into plist."
-
   (require 'json)
-
   (json-parse-string
    raw
    :object-type 'plist
@@ -593,13 +591,28 @@ Each function receives:
 
 (defun poller-lines-parser (raw)
   "Split RAW into lines."
-
   (split-string raw "\n" t))
 
 (defun poller-identity-parser (raw)
   "Return RAW unchanged."
-
   raw)
+
+(defun poller-split-parser (delimiter)
+  "Return a parser that splits RAW string by DELIMITER.
+DELIMITER is a regex."
+  (lambda (raw)
+    (split-string raw delimiter t)))
+
+(defun poller-csv-parser (&optional delimiter)
+  "Parse CSV-like RAW string into list of lists.
+
+DELIMITER defaults to comma."
+  (let ((delim (or delimiter ",")))
+    (lambda (raw)
+      (mapcar
+       (lambda (line)
+         (split-string line delim))
+       (split-string raw "\n" t)))))
 
 ;;;; -------------------------------------------------------------------
 ;;;; Macro API
