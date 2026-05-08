@@ -1,8 +1,7 @@
-;;;-*- lexical-binding: t; -*-
-;;; poller.el --- Extensible async polling/data pipeline framework
+;;; poller.el --- Extensible async polling/data pipeline framework -*- lexical-binding: t; -*-
 
 ;; Author: Mathis Albertzard
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: async, processes, data, polling
 ;; URL: https://github.com/malbertzard/poller.el
@@ -19,18 +18,7 @@
 ;; - target     -> stores transformed data
 ;; - on-error   -> handles errors
 ;;
-;; Example:
-;;
-;;   (defvar my-weather nil)
-;;
-;;   (poller-define
-;;     weather
-;;     :trigger (poller-timer-trigger 300)
-;;     :request #'my-request
-;;     :parser #'json-parse-string
-;;     :target (poller-variable-target 'my-weather))
-;;
-;; Request functions must follow this contract:
+;; Request functions follow this contract:
 ;;
 ;;   (lambda (success error)
 ;;      ...)
@@ -39,26 +27,12 @@
 ;;
 ;;   success -> function called with raw result
 ;;   error   -> function called with error object
-;;
-;; Example request:
-;;
-;;   (defun my-request (success error)
-;;     (url-retrieve
-;;      "https://example.com"
-;;      (lambda (_status)
-;;        (condition-case err
-;;            (progn
-;;              (goto-char (point-min))
-;;              (re-search-forward "\n\n")
-;;              (funcall success
-;;                       (buffer-substring (point) (point-max))))
-;;          (error
-;;           (funcall error err))))))
-;;
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
+(require 'url)
 
 (defgroup poller nil
   "Async polling/data pipeline framework."
@@ -72,6 +46,42 @@
 (defvar poller-jobs nil
   "List of registered poller jobs.")
 
+;;;; -------------------------------------------------------------------
+;;;; Hooks
+;;;; -------------------------------------------------------------------
+
+(defcustom poller-before-run-hook nil
+  "Hook run before a poller job starts.
+
+Each function receives:
+  JOB"
+  :type 'hook)
+
+(defcustom poller-after-success-hook nil
+  "Hook run after successful completion.
+
+Each function receives:
+  JOB PARSED-DATA"
+  :type 'hook)
+
+(defcustom poller-after-error-hook nil
+  "Hook run after a job errors.
+
+Each function receives:
+  JOB ERROR"
+  :type 'hook)
+
+(defcustom poller-after-finish-hook nil
+  "Hook run when a job finishes regardless of outcome.
+
+Each function receives:
+  JOB"
+  :type 'hook)
+
+;;;; -------------------------------------------------------------------
+;;;; Struct
+;;;; -------------------------------------------------------------------
+
 (cl-defstruct poller-job
   name
   trigger
@@ -81,98 +91,237 @@
   on-error
   enabled
   metadata
-  handles)
+  handles
+  running
+  started
+  last-run
+  last-success
+  last-error
+  last-result)
+
+;;;; -------------------------------------------------------------------
+;;;; Logging
+;;;; -------------------------------------------------------------------
 
 (defun poller-log-error (err)
   "Default logger for ERR."
   (message "[poller] error: %S" err))
 
+;;;; -------------------------------------------------------------------
+;;;; Registry
+;;;; -------------------------------------------------------------------
+
 (defun poller-register-job (job)
   "Register JOB in `poller-jobs'."
+
   (setq poller-jobs
         (cl-remove-if
          (lambda (j)
            (equal (poller-job-name j)
                   (poller-job-name job)))
          poller-jobs))
+
   (push job poller-jobs)
+
   job)
 
 (defun poller-get-job (name)
   "Return poller job by NAME."
+
   (cl-find-if
    (lambda (job)
-     (equal (poller-job-name job) name))
+     (equal (poller-job-name job)
+            name))
    poller-jobs))
 
 (defun poller-remove-job (name)
   "Remove poller job by NAME."
+
+  (poller-stop-job name)
+
   (setq poller-jobs
         (cl-remove-if
          (lambda (job)
-           (equal (poller-job-name job) name))
+           (equal (poller-job-name job)
+                  name))
          poller-jobs)))
 
 (defun poller-enable-job (name)
   "Enable poller job NAME."
-  (let ((job (poller-get-job name)))
-    (when job
-      (setf (poller-job-enabled job) t))))
+
+  (when-let ((job (poller-get-job name)))
+    (setf (poller-job-enabled job) t)))
 
 (defun poller-disable-job (name)
   "Disable poller job NAME."
-  (let ((job (poller-get-job name)))
-    (when job
-      (setf (poller-job-enabled job) nil))))
+
+  (when-let ((job (poller-get-job name)))
+    (setf (poller-job-enabled job) nil)))
+
+;;;; -------------------------------------------------------------------
+;;;; Core Runner
+;;;; -------------------------------------------------------------------
 
 (defun poller-run-job (job)
   "Run JOB asynchronously."
+
   (when (poller-job-enabled job)
-    (condition-case outer-err
-        (funcall
-         (poller-job-request job)
-         ;; success callback
-         (lambda (raw-data)
-           (condition-case parse-err
-               (let* ((parser
-                       (or (poller-job-parser job)
-                           #'identity))
-                      (parsed
-                       (funcall parser raw-data))
-                      (target
-                       (poller-job-target job)))
-                 (when target
-                   (funcall target parsed)))
-             (error
-              (funcall
-               (or (poller-job-on-error job)
-                   poller-default-error-handler)
-               parse-err))))
-         ;; error callback
-         (lambda (err)
-           (funcall
-            (or (poller-job-on-error job)
-                poller-default-error-handler)
-            err)))
-      (error
-       (funcall
-        (or (poller-job-on-error job)
-            poller-default-error-handler)
-        outer-err)))))
+
+    ;; prevent overlapping runs
+    (unless (poller-job-running job)
+
+      (setf (poller-job-running job) t)
+      (setf (poller-job-last-run job)
+            (current-time))
+
+      (run-hook-with-args
+       'poller-before-run-hook
+       job)
+
+      (condition-case outer-err
+
+          (funcall
+
+           (poller-job-request job)
+
+           ;; success callback
+           (lambda (raw-data)
+
+             (unwind-protect
+
+                 (condition-case parse-err
+
+                     (let* ((parser
+                             (or (poller-job-parser job)
+                                 #'identity))
+
+                            (parsed
+                             (funcall parser raw-data))
+
+                            (target
+                             (poller-job-target job)))
+
+                       ;; runtime state
+                       (setf (poller-job-last-success job)
+                             (current-time))
+
+                       (setf (poller-job-last-error job)
+                             nil)
+
+                       (setf (poller-job-last-result job)
+                             parsed)
+
+                       ;; target update
+                       (when target
+                         (funcall target parsed))
+
+                       ;; success hooks
+                       (run-hook-with-args
+                        'poller-after-success-hook
+                        job
+                        parsed))
+
+                   (error
+
+                    (setf (poller-job-last-error job)
+                          parse-err)
+
+                    (run-hook-with-args
+                     'poller-after-error-hook
+                     job
+                     parse-err)
+
+                    (funcall
+                     (or (poller-job-on-error job)
+                         poller-default-error-handler)
+                     parse-err)))
+
+               ;; always cleanup
+               (setf (poller-job-running job) nil)
+
+               (run-hook-with-args
+                'poller-after-finish-hook
+                job)))
+
+           ;; error callback
+           (lambda (err)
+
+             (unwind-protect
+
+                 (progn
+
+                   (setf (poller-job-last-error job)
+                         err)
+
+                   (run-hook-with-args
+                    'poller-after-error-hook
+                    job
+                    err)
+
+                   (funcall
+                    (or (poller-job-on-error job)
+                        poller-default-error-handler)
+                    err))
+
+               ;; always cleanup
+               (setf (poller-job-running job) nil)
+
+               (run-hook-with-args
+                'poller-after-finish-hook
+                job))))
+
+        ;; outer setup error
+        (error
+
+         (setf (poller-job-running job) nil)
+
+         (setf (poller-job-last-error job)
+               outer-err)
+
+         (run-hook-with-args
+          'poller-after-error-hook
+          job
+          outer-err)
+
+         (funcall
+          (or (poller-job-on-error job)
+              poller-default-error-handler)
+          outer-err)
+
+         (run-hook-with-args
+          'poller-after-finish-hook
+          job))))))
+
+;;;; -------------------------------------------------------------------
+;;;; Startup / Shutdown
+;;;; -------------------------------------------------------------------
 
 (defun poller-start-job (job)
   "Start JOB using its trigger."
-  (when-let ((trigger (poller-job-trigger job)))
-    (funcall trigger job)))
+
+  ;; prevent duplicate timers/hooks
+  (when (poller-job-started job)
+    (poller-stop-job
+     (poller-job-name job)))
+
+  (when-let ((trigger
+              (poller-job-trigger job)))
+
+    (funcall trigger job)
+
+    (setf (poller-job-started job) t)))
 
 (defun poller-start-all ()
   "Start all registered poller jobs."
+
   (interactive)
+
   (dolist (job poller-jobs)
     (poller-start-job job)))
 
 (defun poller-run-now (name)
   "Immediately run job NAME."
+
   (interactive
    (list
     (intern
@@ -180,13 +329,63 @@
       "Run job: "
       (mapcar
        (lambda (j)
-         (symbol-name (poller-job-name j)))
+         (symbol-name
+          (poller-job-name j)))
        poller-jobs)))))
 
-  (let ((job (poller-get-job name)))
+  (let ((job
+         (poller-get-job name)))
+
     (unless job
       (error "No such job: %S" name))
+
     (poller-run-job job)))
+
+(defun poller-stop-job (name)
+  "Stop timers/hooks associated with NAME."
+
+  (interactive
+   (list
+    (intern
+     (completing-read
+      "Stop job: "
+      (mapcar
+       (lambda (j)
+         (symbol-name
+          (poller-job-name j)))
+       poller-jobs)))))
+
+  (let ((job
+         (poller-get-job name)))
+
+    (unless job
+      (error "No such job: %S" name))
+
+    (dolist (handle
+             (poller-job-handles job))
+
+      (cond
+
+       ((timerp handle)
+        (cancel-timer handle))
+
+       ((consp handle)
+        (remove-hook
+         (car handle)
+         (cdr handle)))))
+
+    (setf (poller-job-handles job) nil)
+    (setf (poller-job-running job) nil)
+    (setf (poller-job-started job) nil)))
+
+(defun poller-stop-all ()
+  "Stop all poller jobs."
+
+  (interactive)
+
+  (dolist (job poller-jobs)
+    (poller-stop-job
+     (poller-job-name job))))
 
 ;;;; -------------------------------------------------------------------
 ;;;; Trigger Helpers
@@ -194,6 +393,7 @@
 
 (defun poller-timer-trigger (interval)
   "Create repeating timer trigger using INTERVAL seconds."
+
   (lambda (job)
 
     (let ((timer
@@ -203,8 +403,9 @@
             (lambda ()
               (poller-run-job job)))))
 
-      (push timer
-            (poller-job-handles job))
+      (setf (poller-job-handles job)
+            (cons timer
+                  (poller-job-handles job)))
 
       timer)))
 
@@ -220,8 +421,9 @@
             (lambda ()
               (poller-run-job job)))))
 
-      (push timer
-            (poller-job-handles job))
+      (setf (poller-job-handles job)
+            (cons timer
+                  (poller-job-handles job)))
 
       timer)))
 
@@ -229,12 +431,16 @@
   "Create trigger that runs on HOOK."
 
   (lambda (job)
+
     (let ((fn
            (lambda (&rest _)
              (poller-run-job job))))
+
       (add-hook hook fn)
-      (push (cons hook fn)
-            (poller-job-handles job))
+
+      (setf (poller-job-handles job)
+            (cons (cons hook fn)
+                  (poller-job-handles job)))
 
       fn)))
 
@@ -258,11 +464,16 @@
   "Insert value into BUFFER-NAME."
 
   (lambda (value)
+
     (with-current-buffer
         (get-buffer-create buffer-name)
-      (erase-buffer)
-      (insert
-       (format "%s" value)))))
+
+      (let ((inhibit-read-only t))
+
+        (erase-buffer)
+
+        (insert
+         (format "%s" value))))))
 
 ;;;; -------------------------------------------------------------------
 ;;;; Request Helpers
@@ -271,52 +482,87 @@
 (defun poller-url-request (url)
   "Create async URL request for URL."
 
-  (require 'url)
-
   (lambda (success error)
+
     (url-retrieve
+
      url
 
      (lambda (_status)
-       (condition-case err
-           (progn
-             (goto-char (point-min))
-             (re-search-forward "\n\n")
-             (let ((body
-                    (buffer-substring
-                     (point)
-                     (point-max))))
 
-               (kill-buffer (current-buffer))
-               (funcall success body)))
+       (let ((buf
+              (current-buffer)))
 
-         (error
-          (funcall error err)))))))
+         (condition-case err
+
+             (with-current-buffer buf
+
+               (goto-char (point-min))
+
+               (re-search-forward "\n\n")
+
+               (let ((body
+                      (buffer-substring
+                       (point)
+                       (point-max))))
+
+                 (kill-buffer buf)
+
+                 (funcall success body)))
+
+           (error
+
+            (when (buffer-live-p buf)
+              (kill-buffer buf))
+
+            (funcall error err))))))))
 
 (defun poller-process-request (command &optional args)
   "Create async process request from COMMAND and ARGS."
 
   (lambda (success error)
+
     (let ((buffer
            (generate-new-buffer
             (format "*poller-%s*" command))))
 
       (make-process
        :name (format "poller-%s" command)
+
        :buffer buffer
-       :command (append (list command) args)
+
+       :command
+       (append (list command)
+               args)
+
        :sentinel
        (lambda (proc _event)
-         (unwind-protect
-             (if (= 0 (process-exit-status proc))
-                 (with-current-buffer (process-buffer proc)
-                   (funcall success
-                            (buffer-string)))
-               (funcall error
-                        (format "Process failed: %s"
-                                (process-exit-status proc))))
-           (kill-buffer
-            (process-buffer proc))))))))
+
+         (when (memq (process-status proc)
+                     '(exit signal))
+
+           (unwind-protect
+
+               (if (= 0
+                      (process-exit-status proc))
+
+                   (with-current-buffer
+                       (process-buffer proc)
+
+                     (funcall success
+                              (buffer-string)))
+
+                 (funcall
+                  error
+                  (format
+                   "Process failed: %s"
+                   (process-exit-status proc))))
+
+             (when (buffer-live-p
+                    (process-buffer proc))
+
+               (kill-buffer
+                (process-buffer proc))))))))))
 
 (defun poller-function-request (fn)
   "Wrap synchronous FN into async callback style."
@@ -356,63 +602,19 @@
   raw)
 
 ;;;; -------------------------------------------------------------------
-;;;; Cleanup
-;;;; -------------------------------------------------------------------
-
-(defun poller-stop-job (name)
-  "Stop timers/hooks associated with NAME."
-
-  (interactive
-   (list
-    (intern
-     (completing-read
-      "Stop job: "
-      (mapcar
-       (lambda (j)
-         (symbol-name
-          (poller-job-name j)))
-       poller-jobs)))))
-
-  (let ((job (poller-get-job name)))
-
-    (unless job
-      (error "No such job: %S" name))
-
-    (dolist (handle (poller-job-handles job))
-
-      (cond
-
-       ((timerp handle)
-        (cancel-timer handle))
-
-       ((consp handle)
-        (remove-hook
-         (car handle)
-         (cdr handle)))))
-
-    (setf (poller-job-handles job) nil)))
-
-(defun poller-stop-all ()
-  "Stop all poller jobs."
-
-  (interactive)
-
-  (dolist (job poller-jobs)
-    (poller-stop-job
-     (poller-job-name job))))
-
-;;;; -------------------------------------------------------------------
 ;;;; Macro API
 ;;;; -------------------------------------------------------------------
 
-(cl-defmacro poller-define (name &key
-                                 trigger
-                                 request
-                                 parser
-                                 target
-                                 on-error
-                                 metadata
-                                 disabled)
+(cl-defmacro poller-define
+    (name
+     &key
+     trigger
+     request
+     parser
+     target
+     on-error
+     metadata
+     disabled)
 
   "Define and register a poller job."
 
@@ -421,41 +623,29 @@
     (make-poller-job
 
      :name ',name
+
      :trigger ,trigger
+
      :request ,request
+
      :parser ,(or parser
                   #'identity)
+
      :target ,target
-     :on-error ,(or on-error
-                    'poller-default-error-handler)
+
+     :on-error
+     ,(or on-error
+          'poller-default-error-handler)
 
      :enabled ,(not disabled)
-     :metadata ,metadata)))
 
-;;;; -------------------------------------------------------------------
-;;;; Example
-;;;; -------------------------------------------------------------------
+     :metadata ,metadata
 
-;; (defvar my-ip-data nil)
-;;
-;; (poller-define
-;;   ip-fetcher
-;;
-;;   :trigger
-;;   (poller-timer-trigger 60)
-;;
-;;   :request
-;;   (poller-url-request
-;;    "https://api.ipify.org?format=json")
-;;
-;;   :parser
-;;   #'poller-json-parser
-;;
-;;   :target
-;;   (poller-variable-target
-;;    'my-ip-data))
-;;
-;; (poller-start-all)
+     :handles nil
+
+     :running nil
+
+     :started nil)))
 
 (provide 'poller)
 
